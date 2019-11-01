@@ -3,7 +3,8 @@ package jwt
 
 import (
 	"github.com/ant0ine/go-json-rest/rest"
-	"github.com/dgrijalva/jwt-go"
+	"gopkg.in/square/go-jose.v2"
+	"gopkg.in/square/go-jose.v2/jwt"
 
 	"errors"
 	"log"
@@ -20,6 +21,12 @@ import (
 type JWTMiddleware struct {
 	// Realm name to display to the user. Required.
 	Realm string
+
+	// Issuer to issued the	JWT.
+	Issuer string
+
+	// the subject of the JWT.
+	Subject string
 
 	// signing algorithm - possible values are HS256, HS384, HS512
 	// Optional, default is HS256.
@@ -83,24 +90,31 @@ func (mw *JWTMiddleware) MiddlewareFunc(handler rest.HandlerFunc) rest.HandlerFu
 }
 
 func (mw *JWTMiddleware) middlewareImpl(writer rest.ResponseWriter, request *rest.Request, handler rest.HandlerFunc) {
-	token, err := mw.parseToken(request)
+	claims, payload, err := mw.parseToken(request)
 
 	if err != nil {
 		mw.unauthorized(writer)
 		return
 	}
 
-	claims, ok := token.Claims.(jwt.MapClaims)
-
-	if !ok || !token.Valid || claims["id"] == nil {
+	err = claims.Validate(jwt.Expected{
+		Issuer:  mw.Issuer,
+		Subject: mw.Subject,
+		Time:    time.Now(),
+	})
+	if err != nil {
 		mw.unauthorized(writer)
 		return
 	}
 
-	id := claims["id"].(string)
+	id := claims.ID
+	if id == "" {
+		mw.unauthorized(writer)
+		return
+	}
 
 	request.Env["REMOTE_USER"] = id
-	request.Env["JWT_PAYLOAD"] = claims
+	request.Env["JWT_PAYLOAD"] = payload
 
 	if !mw.Authorizator(id, request) {
 		mw.unauthorized(writer)
@@ -111,12 +125,12 @@ func (mw *JWTMiddleware) middlewareImpl(writer rest.ResponseWriter, request *res
 }
 
 // ExtractClaims allows to retrieve the payload
-func ExtractClaims(request *rest.Request) jwt.MapClaims {
+func ExtractClaims(request *rest.Request) map[string]interface{} {
 	if request.Env["JWT_PAYLOAD"] == nil {
-		emptyClaims := jwt.MapClaims{}
+		emptyClaims := map[string]interface{}{}
 		return emptyClaims
 	}
-	jwtClaims := request.Env["JWT_PAYLOAD"].(jwt.MapClaims)
+	jwtClaims := request.Env["JWT_PAYLOAD"].(map[string]interface{})
 	return jwtClaims
 }
 
@@ -146,59 +160,89 @@ func (mw *JWTMiddleware) LoginHandler(writer rest.ResponseWriter, request *rest.
 		return
 	}
 
-	signMethod := jwt.GetSigningMethod(mw.SigningAlgorithm)
+	signMethod := jose.SignatureAlgorithm(mw.SigningAlgorithm)
 
 	// Create the Claims
-	claims := jwt.MapClaims{}
+	c1 := jwt.Claims{}
+
+	c1.ID = loginVals.Username
+	c1.Issuer = mw.Issuer
+	c1.Subject = mw.Subject
+	c1.Expiry = jwt.NewNumericDate(time.Now().Add(mw.Timeout))
+
+	if mw.MaxRefresh != 0 {
+		c1.IssuedAt = jwt.NewNumericDate(time.Now())
+	}
+
+	c2 := struct {
+		Playload map[string]interface{} `json:"playload"`
+	}{}
 
 	if mw.PayloadFunc != nil {
+		c2.Playload = make(map[string]interface{})
 		for key, value := range mw.PayloadFunc(loginVals.Username) {
-			claims[key] = value
+			c2.Playload[key] = value
 		}
 	}
 
-	claims["id"] = loginVals.Username
-	claims["exp"] = time.Now().Add(mw.Timeout).Unix()
-	if mw.MaxRefresh != 0 {
-		claims["iat"] = time.Now().Unix()
+	sig, err := jose.NewSigner(
+		jose.SigningKey{
+			Algorithm: signMethod,
+			Key:       mw.Key,
+		},
+		(&jose.SignerOptions{}).WithType("JWT"))
+	if err != nil {
+		mw.unauthorized(writer)
+		return
 	}
 
-	token := jwt.NewWithClaims(signMethod, claims)
-	ss, err := token.SignedString(mw.Key)
+	raw, err := jwt.Signed(sig).
+		Claims(c1).
+		Claims(c2).
+		CompactSerialize()
 
 	if err != nil {
 		mw.unauthorized(writer)
 		return
 	}
 
-	writer.WriteJson(resultToken{Token: ss})
+	_ = writer.WriteJson(resultToken{Token: raw})
 }
 
-func (mw *JWTMiddleware) parseToken(request *rest.Request) (*jwt.Token, error) {
+func (mw *JWTMiddleware) parseToken(request *rest.Request) (*jwt.Claims, map[string]interface{}, error) {
 	authHeader := request.Header.Get("Authorization")
 
 	if authHeader == "" {
-		return nil, errors.New("Auth header empty")
+		return nil, nil, errors.New("Auth header empty")
 	}
 
 	parts := strings.SplitN(authHeader, " ", 2)
 	if !(len(parts) == 2 && parts[0] == "Bearer") {
-		return nil, errors.New("Invalid auth header")
+		return nil, nil, errors.New("Invalid auth header")
 	}
 
-	return jwt.Parse(parts[1], func(token *jwt.Token) (interface{}, error) {
-		if jwt.GetSigningMethod(mw.SigningAlgorithm) != token.Method {
-			return nil, errors.New("Invalid signing algorithm")
-		}
-		return mw.Key, nil
-	})
+	tok, err := jwt.ParseSigned(parts[1])
+	if err != nil {
+		return nil, nil, err
+	}
+
+	var c1 jwt.Claims
+	c2 := struct {
+		Playload map[string]interface{} `json:"playload"`
+	}{}
+
+	err = tok.Claims(mw.Key, &c1, &c2)
+	if err != nil {
+		return nil, nil, err
+	}
+	return &c1, c2.Playload, nil
 }
 
 // RefreshHandler can be used to refresh a token. The token still needs to be valid on refresh.
 // Shall be put under an endpoint that is using the JWTMiddleware.
 // Reply will be of the form {"token": "TOKEN"}.
 func (mw *JWTMiddleware) RefreshHandler(writer rest.ResponseWriter, request *rest.Request) {
-	token, err := mw.parseToken(request)
+	c1, playload, err := mw.parseToken(request)
 
 	// Token should be valid anyway as the RefreshHandler is authed
 	if err != nil {
@@ -206,39 +250,52 @@ func (mw *JWTMiddleware) RefreshHandler(writer rest.ResponseWriter, request *res
 		return
 	}
 
-	oldClaims, ok := token.Claims.(jwt.MapClaims)
-	if !ok {
+	err = c1.Validate(jwt.Expected{
+		Issuer:  mw.Issuer,
+		Subject: mw.Subject,
+		Time:    time.Now(),
+	})
+	if err != nil {
 		mw.unauthorized(writer)
 		return
 	}
 
-	signMethod := jwt.GetSigningMethod(mw.SigningAlgorithm)
+	signMethod := jose.SignatureAlgorithm(mw.SigningAlgorithm)
 
-	origIat := int64(oldClaims["orig_iat"].(float64))
+	c1.Expiry = jwt.NewNumericDate(time.Now().Add(mw.Timeout))
 
-	if origIat < time.Now().Add(-mw.MaxRefresh).Unix() {
+	if mw.MaxRefresh != 0 {
+		c1.IssuedAt = jwt.NewNumericDate(time.Now())
+	}
+
+	c2 := struct {
+		Playload map[string]interface{} `json:"playload"`
+	}{}
+
+	c2.Playload = playload
+
+	sig, err := jose.NewSigner(
+		jose.SigningKey{
+			Algorithm: signMethod,
+			Key:       mw.Key,
+		},
+		(&jose.SignerOptions{}).WithType("JWT"))
+	if err != nil {
 		mw.unauthorized(writer)
 		return
 	}
 
-	newClaims := jwt.MapClaims{}
-	for key := range oldClaims {
-		newClaims[key] = oldClaims[key]
-	}
-
-	newClaims["id"] = oldClaims["id"]
-	newClaims["exp"] = time.Now().Add(mw.Timeout).Unix()
-	newClaims["orig_iat"] = origIat
-
-	newToken := jwt.NewWithClaims(signMethod, newClaims)
-	tokenString, err := newToken.SignedString(mw.Key)
+	raw, err := jwt.Signed(sig).
+		Claims(c1).
+		Claims(c2).
+		CompactSerialize()
 
 	if err != nil {
 		mw.unauthorized(writer)
 		return
 	}
 
-	writer.WriteJson(resultToken{Token: tokenString})
+	_ = writer.WriteJson(resultToken{Token: raw})
 }
 
 func (mw *JWTMiddleware) unauthorized(writer rest.ResponseWriter) {
